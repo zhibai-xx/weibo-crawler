@@ -17,6 +17,7 @@ import time
 import warnings
 import webbrowser
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import sleep
@@ -34,6 +35,7 @@ from util import csvutil
 from util.dateutil import convert_to_days_ago
 from util.notify import push_deer
 from util.llm_analyzer import LLMAnalyzer  # 导入 LLM 分析器
+from util.anti_ban import GlobalAntiBanState, create_default_anti_ban_state
 
 import piexif
 
@@ -50,9 +52,17 @@ logger = logging.getLogger("weibo")
 DTFORMAT = "%Y-%m-%dT%H:%M:%S"
 
 class Weibo(object):
-    def __init__(self, config):
-        """Weibo类初始化"""
+    def __init__(self, config, anti_ban_state=None, file_locks=None):
+        """Weibo类初始化
+
+        Args:
+            config: 配置字典
+            anti_ban_state: 可选，共享的 GlobalAntiBanState 实例（并行模式用）
+            file_locks: 可选，共享的文件锁字典，keys: 'users_csv', 'config_file'
+        """
         self.validate_config(config)
+        self._anti_ban_state = anti_ban_state  # 共享反封禁状态（并行模式）
+        self._shared_locks = file_locks or {}   # 共享文件锁（并行模式）
         self.only_crawl_original = config["only_crawl_original"]  # 取值范围为0、1,程序默认值为0,代表要爬取用户的全部微博,1代表只爬取用户的原创微博
         self.remove_html_tag = config[
             "remove_html_tag"
@@ -131,7 +141,12 @@ class Weibo(object):
         # Cookie支持：优先使用环境变量WEIBO_COOKIE，其次使用config.json中的配置
         cookie_config = config.get("cookie")
         cookie_string = os.environ.get("WEIBO_COOKIE") or cookie_config
-        
+
+        # 兼容 cookie 为列表的情况（多 cookie 并行支持）
+        if isinstance(cookie_string, list):
+            cookie_string = cookie_string[0] if cookie_string else None
+
+        # 支持 Cookie 文件（.txt 后缀，来自上游功能）
         self.cookie_file_path = None
         if isinstance(cookie_config, str) and cookie_config.endswith('.txt'):
             self.cookie_file_path = cookie_config
@@ -142,7 +157,8 @@ class Weibo(object):
             else:
                 logger.warning(f"Cookie文件 {self.cookie_file_path} 不存在，将使用默认空Cookie")
                 cookie_string = ""
-        elif os.environ.get("WEIBO_COOKIE"):
+
+        if os.environ.get("WEIBO_COOKIE"):
             logger.info("使用环境变量WEIBO_COOKIE中的Cookie")
         
         core_cookies = {}   # 核心包
@@ -251,104 +267,36 @@ class Weibo(object):
         self.long_sleep_count_before_each_user = 0 #每个用户前的长时间sleep避免被ban
         self.store_binary_in_sqlite = config.get("store_binary_in_sqlite", 0)
 
+        # 异步下载线程池（Phase 4）
+        self._download_futures = []
+        self._download_executor = None  # 延迟创建
+        from threading import Lock
+        self._download_lock = Lock()
+
         # 防封禁配置初始化
         self.anti_ban_config = config.get("anti_ban_config", {})
         self.anti_ban_enabled = self.anti_ban_config.get("enabled", False)
 
-        # 爬取状态跟踪
-        self.crawl_stats = {
-            "weibo_count": 0,      # 已爬取微博数
-            "request_count": 0,    # 已发送请求数
-            "api_errors": 0,       # API错误数
-            "start_time": None,    # 开始时间
-            "batch_count": 0,      # 当前批次计数
-            "last_batch_time": None # 上次批次时间
-        }
+        # 爬取状态跟踪（支持共享模式）
+        if self._anti_ban_state is None:
+            self._anti_ban_state = create_default_anti_ban_state(config)
+
     def calculate_dynamic_delay(self):
         """计算动态延迟时间"""
-        if not self.anti_ban_enabled:
-            return 0
-
-        config = self.anti_ban_config
-        base_delay = config.get("request_delay_min", 8)
-
-        # 根据请求次数增加延迟
-        request_count = self.crawl_stats["request_count"]
-        if request_count > 100:
-            base_delay += 5
-        if request_count > 300:
-            base_delay += 10
-
-        # 根据爬取时间增加延迟
-        if self.crawl_stats["start_time"]:
-            time_elapsed = time.time() - self.crawl_stats["start_time"]
-            if time_elapsed > 300:  # 5分钟
-                base_delay += 5
-
-        # 随机波动
-        max_delay = config.get("request_delay_max", 15)
-        return random.uniform(base_delay, max_delay)
+        return self._anti_ban_state.get_dynamic_delay()
 
     def should_pause_session(self):
         """检查是否应该暂停当前会话"""
-        if not self.anti_ban_enabled:
-            return False, ""
-
-        config = self.anti_ban_config
-        current_time = time.time()
-
-        # 条件1：达到数量阈值
-        max_weibo = config.get("max_weibo_per_session", 500)
-        if self.crawl_stats["weibo_count"] >= max_weibo:
-            return True, f"达到单次运行最大微博数({max_weibo})"
-
-        # 条件2：运行时间过长
-        if self.crawl_stats["start_time"]:
-            session_time = current_time - self.crawl_stats["start_time"]
-            max_time = config.get("max_session_time", 600)
-            if session_time > max_time:
-                return True, f"单次运行时间过长({int(session_time)}秒)"
-
-        # 条件3：API错误率过高
-        max_errors = config.get("max_api_errors", 5)
-        if self.crawl_stats["api_errors"] >= max_errors:
-            return True, f"API错误过多({self.crawl_stats['api_errors']}次)"
-
-        # 条件4：随机概率（模拟用户休息）
-        random_prob = config.get("random_rest_probability", 0.01)
-        if random.random() < random_prob:
-            return True, "随机休息"
-
-        return False, ""
+        return self._anti_ban_state.should_pause()
 
     def check_batch_delay(self):
         """检查是否需要批次延迟"""
-        if not self.anti_ban_enabled:
-            return
-
-        config = self.anti_ban_config
-        batch_size = config.get("batch_size", 50)
-        batch_delay = config.get("batch_delay", 30)
-
-        # 检查是否达到批次大小
-        if self.crawl_stats["batch_count"] >= batch_size:
-            current_time = time.time()
-
-            # 检查距离上次批次的时间
-            if self.crawl_stats["last_batch_time"]:
-                time_since_last_batch = current_time - self.crawl_stats["last_batch_time"]
-                if time_since_last_batch < batch_delay:
-                    # 如果距离上次批次时间太短，等待补足
-                    wait_time = batch_delay - time_since_last_batch
-                    logger.info(f"批次延迟: 等待 {wait_time:.1f} 秒")
-                    sleep(wait_time)
-
-            logger.info(f"批次延迟: 等待 {batch_delay} 秒")
-            sleep(batch_delay)
-
-            # 重置批次计数
-            self.crawl_stats["batch_count"] = 0
-            self.crawl_stats["last_batch_time"] = time.time()
+        wait_time = self._anti_ban_state.check_batch_delay()
+        if wait_time > 0:
+            logger.info(f"批次延迟: 等待 {wait_time:.1f} 秒")
+            sleep(wait_time)
+            self._anti_ban_state.reset_batch_count()
+            self._anti_ban_state.update_batch_time()
 
     def get_random_headers(self):
         """获取随机请求头"""
@@ -397,27 +345,16 @@ class Weibo(object):
         """更新爬取统计"""
         if not self.anti_ban_enabled:
             return
-
         if weibo_count > 0:
-            self.crawl_stats["weibo_count"] += weibo_count
-            self.crawl_stats["batch_count"] += weibo_count
-
+            self._anti_ban_state.record_weibo(weibo_count)
         if request_count > 0:
-            self.crawl_stats["request_count"] += request_count
-
+            self._anti_ban_state.record_request(request_count)
         if api_error:
-            self.crawl_stats["api_errors"] += 1
+            self._anti_ban_state.record_error()
 
     def reset_crawl_stats(self):
         """重置爬取统计（休息后调用）"""
-        self.crawl_stats = {
-            "weibo_count": 0,
-            "request_count": 0,
-            "api_errors": 0,
-            "start_time": time.time(),
-            "batch_count": 0,
-            "last_batch_time": None
-        }
+        self._anti_ban_state.reset()
         logger.info("爬取统计已重置，继续爬取")
 
     def perform_anti_ban_rest(self):
@@ -707,10 +644,17 @@ class Weibo(object):
                 for v in self.user.values()
             ]
         ]
-        # 已经插入信息的用户无需重复插入，返回的id是空字符串或微博id 发布日期%Y-%m-%d
-        last_weibo_msg = csvutil.insert_or_update_user(
-            logger, result_headers, result_data, file_path
-        )
+        # 使用共享锁保护 users.csv 的并发读写
+        lock = self._shared_locks.get("users_csv")
+        if lock:
+            lock.acquire()
+        try:
+            last_weibo_msg = csvutil.insert_or_update_user(
+                logger, result_headers, result_data, file_path
+            )
+        finally:
+            if lock:
+                lock.release()
         self.last_weibo_id = last_weibo_msg.split(" ")[0] if last_weibo_msg else ""
         self.last_weibo_date = (
             last_weibo_msg.split(" ")[1]
@@ -1210,17 +1154,18 @@ class Weibo(object):
             else:
                 logger.debug("[DEBUG] failed " + url + " TOTALLY")
                 error_file = self.get_filepath(type) + os.sep + "not_downloaded.txt"
-                with open(error_file, "ab") as f:
-                    error_entry = f"{weibo_id}:{file_path}:{url}\n"
-                    f.write(error_entry.encode(sys.stdout.encoding))
+                with self._download_lock:
+                    with open(error_file, "ab") as f:
+                        error_entry = f"{weibo_id}:{file_path}:{url}\n"
+                        f.write(error_entry.encode(sys.stdout.encoding))
         except Exception as e:
             # 生成原始微博URL
             original_url = f"https://m.weibo.cn/detail/{weibo_id}"  # 新增
             error_file = self.get_filepath(type) + os.sep + "not_downloaded.txt"
-            with open(error_file, "ab") as f:
-                # 修改错误条目格式，添加原始URL
-                error_entry = f"{weibo_id}:{file_path}:{url}:{original_url}\n"  # 修改
-                f.write(error_entry.encode(sys.stdout.encoding))
+            with self._download_lock:
+                with open(error_file, "ab") as f:
+                    error_entry = f"{weibo_id}:{file_path}:{url}:{original_url}\n"  # 修改
+                    f.write(error_entry.encode(sys.stdout.encoding))
             logger.exception(e)
 
     def sqlite_exist_file(self, url):
@@ -1340,6 +1285,26 @@ class Weibo(object):
 
         return file_names
 
+    def _get_download_executor(self):
+        """获取或创建下载线程池"""
+        if self._download_executor is None:
+            self._download_executor = ThreadPoolExecutor(max_workers=3)
+        return self._download_executor
+
+    def _wait_downloads(self):
+        """等待所有待完成的下载任务"""
+        if not self._download_futures:
+            return
+        remaining = len(self._download_futures)
+        logger.info(f"等待 {remaining} 个下载任务完成...")
+        for future in as_completed(self._download_futures[:]):
+            try:
+                future.result(timeout=300)
+            except Exception:
+                pass
+        self._download_futures = []
+        logger.info("所有下载任务已完成")
+
     def download_files(self, file_type, weibo_type, wrote_count):
         try:
             describe = ""
@@ -1409,10 +1374,14 @@ class Weibo(object):
                     file_dir = os.path.join(month_dir, describe)
                     if not os.path.isdir(file_dir):
                         os.makedirs(file_dir)
-                    
-                    self.handle_download(file_type, file_dir, weibo_data.get(key), weibo_data)
-                
-                logger.info("%s下载完毕", describe)
+
+                    future = self._get_download_executor().submit(
+                        self.handle_download, file_type, file_dir,
+                        weibo_data.get(key), weibo_data
+                    )
+                    self._download_futures.append(future)
+
+                logger.info("%s下载已提交", describe)
             else:
                 # 原有逻辑：所有文件放在同一目录
                 file_dir = self.get_filepath(file_type)
@@ -1428,9 +1397,13 @@ class Weibo(object):
                         else:
                             continue
                     if w.get(key):
-                        self.handle_download(file_type, file_dir, w.get(key), w)
-                
-                logger.info("%s下载完毕,保存路径:", describe)
+                        future = self._get_download_executor().submit(
+                            self.handle_download, file_type, file_dir,
+                            w.get(key), w
+                        )
+                        self._download_futures.append(future)
+
+                logger.info("%s下载已提交,保存路径:", describe)
                 logger.info(file_dir)
         except Exception as e:
             logger.exception(e)
@@ -2873,28 +2846,35 @@ class Weibo(object):
 
     def update_user_config_file(self, user_config_file_path):
         """更新用户配置文件"""
-        with open(user_config_file_path, "rb") as f:
-            try:
-                lines = f.read().splitlines()
-                lines = [line.decode("utf-8-sig") for line in lines]
-            except UnicodeDecodeError:
-                logger.error("%s文件应为utf-8编码，请先将文件编码转为utf-8再运行程序", user_config_file_path)
-                sys.exit()
-            for i, line in enumerate(lines):
-                info = line.split(" ")
-                if len(info) > 0 and info[0].isdigit():
-                    if self.user_config["user_id"] == info[0]:
-                        if len(info) == 1:
-                            info.append(self.user["screen_name"])
-                            info.append(self.start_date)
-                        if len(info) == 2:
-                            info.append(self.start_date)
-                        if len(info) > 2:
-                            info[2] = self.start_date
-                        lines[i] = " ".join(info)
-                        break
-        with codecs.open(user_config_file_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        lock = self._shared_locks.get("config_file")
+        if lock:
+            lock.acquire()
+        try:
+            with open(user_config_file_path, "rb") as f:
+                try:
+                    lines = f.read().splitlines()
+                    lines = [line.decode("utf-8-sig") for line in lines]
+                except UnicodeDecodeError:
+                    logger.error("%s文件应为utf-8编码，请先将文件编码转为utf-8再运行程序", user_config_file_path)
+                    sys.exit()
+                for i, line in enumerate(lines):
+                    info = line.split(" ")
+                    if len(info) > 0 and info[0].isdigit():
+                        if self.user_config["user_id"] == info[0]:
+                            if len(info) == 1:
+                                info.append(self.user["screen_name"])
+                                info.append(self.start_date)
+                            if len(info) == 2:
+                                info.append(self.start_date)
+                            if len(info) > 2:
+                                info[2] = self.start_date
+                            lines[i] = " ".join(info)
+                            break
+            with codecs.open(user_config_file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        finally:
+            if lock:
+                lock.release()
 
     def write_markdown(self, wrote_count):
         """将爬到的信息写入markdown文件"""
@@ -3339,7 +3319,7 @@ class Weibo(object):
 
             # 防封禁：初始化爬取统计
             if self.anti_ban_enabled:
-                self.crawl_stats["start_time"] = time.time()
+                self._anti_ban_state.ensure_start_time()
                 cfg = self.anti_ban_config
                 logger.info("🛡️ 防封禁模式已启用")
                 logger.info("┌────────────────────────────────────┐")
@@ -3408,10 +3388,13 @@ class Weibo(object):
 
                 self.write_data(wrote_count)  # 将剩余不足20页的微博写入文件
 
+            # 等待所有异步下载完成
+            self._wait_downloads()
+
             # 防封禁：输出统计信息
             if self.anti_ban_enabled:
-                session_time = time.time() - self.crawl_stats["start_time"]
-                logger.info(f"防封禁统计: 微博={self.crawl_stats['weibo_count']}, 请求={self.crawl_stats['request_count']}, 错误={self.crawl_stats['api_errors']}, 耗时={int(session_time)}秒")
+                session_time = time.time() - (self._anti_ban_state.start_time or time.time())
+                logger.info(f"防封禁统计: 微博={self._anti_ban_state.weibo_count}, 请求={self._anti_ban_state.request_count}, 错误={self._anti_ban_state.api_errors}, 耗时={int(session_time)}秒")
 
             logger.info("微博爬取完成，共爬取%d条微博", self.got_count)
         except Exception as e:
@@ -3467,6 +3450,7 @@ class Weibo(object):
         self.user_config = user_config
         self.got_count = 0
         self.weibo_id_list = []
+        self._download_futures = []
 
     def save_cookies_to_file(self):
         """将 Session 中最新的 Cookie 写回文件"""
@@ -3555,11 +3539,143 @@ def get_config():
         sys.exit()
 
 
+def _serial_crawl(config):
+    """串行爬取（原行为）"""
+    wb = Weibo(config)
+    wb.start()
+
+
+def _parse_user_config_list(config):
+    """从配置中解析用户列表（与 Weibo.__init__ 逻辑一致）"""
+    user_id_list = config["user_id_list"]
+    since_date = config["since_date"]
+    end_date = config.get("end_date", "")
+    query_list = config.get("query_list") or []
+    if isinstance(query_list, str):
+        query_list = query_list.split(",")
+
+    if not isinstance(user_id_list, list):
+        if not os.path.isabs(user_id_list):
+            user_id_list = (
+                os.path.split(os.path.realpath(__file__))[0] + os.sep + user_id_list
+            )
+        # 需要实例来解析 txt 文件
+        wb = Weibo(config)
+        return wb.get_user_config_list(user_id_list)
+    else:
+        user_config_list = [
+            {
+                "user_id": user_id,
+                "since_date": since_date,
+                "end_date": end_date,
+                "query_list": query_list,
+            }
+            for user_id in user_id_list
+        ]
+        return user_config_list
+
+
+def _run_user_worker(worker_id, cookie, base_config, user_config,
+                     anti_ban_state, file_locks):
+    """并行模式的单个用户爬取任务
+
+    Args:
+        worker_id: worker 编号
+        cookie: 本 worker 使用的 cookie 字符串
+        base_config: 基础配置字典（含 anti_ban_config 但不含 cookie）
+        user_config: 单个用户的配置 {"user_id", "since_date", "end_date", "query_list"}
+        anti_ban_state: 共享的 GlobalAntiBanState 实例
+        file_locks: 共享的文件锁字典
+    """
+    config = base_config.copy()
+    config["cookie"] = cookie
+    config["user_id_list"] = [user_config["user_id"]]
+
+    # 传递 per-user 的 since_date / end_date / query_list（txt 文件模式）
+    if "since_date" in user_config:
+        config["since_date"] = user_config["since_date"]
+    if "end_date" in user_config:
+        config["end_date"] = user_config.get("end_date", config.get("end_date", ""))
+    if "query_list" in user_config and user_config["query_list"]:
+        config["query_list"] = user_config["query_list"]
+
+    wb = Weibo(config, anti_ban_state=anti_ban_state, file_locks=file_locks)
+    wb.start()
+
+
+def _parallel_crawl(config, cookies, max_workers):
+    """并行爬取分发器"""
+    anti_ban_state = GlobalAntiBanState(config.get("anti_ban_config", {}))
+
+    from threading import Lock
+    file_locks = {
+        "users_csv": Lock(),
+        "config_file": Lock(),
+    }
+
+    user_config_list = _parse_user_config_list(config)
+    random.shuffle(user_config_list)
+
+    logger.info(f"并行模式启用: max_workers={max_workers}, "
+                f"cookies={len(cookies)}, users={len(user_config_list)}")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for i, user_config in enumerate(user_config_list):
+            cookie_index = i % len(cookies)
+            cookie = cookies[cookie_index]
+            future = executor.submit(
+                _run_user_worker,
+                cookie_index + 1,
+                cookie,
+                config,
+                user_config,
+                anti_ban_state,
+                file_locks,
+            )
+            futures[future] = user_config
+
+        for future in as_completed(futures):
+            uc = futures[future]
+            try:
+                future.result()
+                logger.info(f"用户 {uc.get('user_id')} 爬取完成")
+            except Exception as e:
+                logger.exception(f"用户 {uc.get('user_id')} 爬取失败: {e}")
+
+
 def main():
     try:
         config = get_config()
-        wb = Weibo(config)
-        wb.start()  # 爬取微博信息
+
+        # 判断是否启用并行模式
+        parallel_config = config.get("parallel", {})
+        max_workers = parallel_config.get("max_workers", 1) if parallel_config else 1
+
+        if max_workers > 1 and not parallel_config.get("enable", True):
+            max_workers = 1
+
+        if max_workers > 1:
+            # cookies 字段优先，cookie 字段其次（支持字符串和数组两种格式）
+            cookies = config.get("cookies") or []
+            if not cookies:
+                raw_cookie = config.get("cookie")
+                if isinstance(raw_cookie, list):
+                    cookies = raw_cookie
+                elif raw_cookie:
+                    cookies = [raw_cookie]
+
+            if len(cookies) <= 1:
+                logger.warning("并行模式需要至少 2 个 cookie，回退为串行模式")
+                max_workers = 1
+
+        if max_workers <= 1:
+            _serial_crawl(config)
+        else:
+            max_workers = min(max_workers, len(cookies))
+            _parallel_crawl(config, cookies, max_workers)
+
         if const.NOTIFY["NOTIFY"]:
             push_deer("更新了一次微博")
     except Exception as e:

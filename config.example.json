@@ -1,0 +1,258 @@
+{
+    // ============================================================
+    //  weibo-crawler 配置文件（JSON5 格式，支持注释和尾随逗号）
+    //  复制此文件为 config.json 并根据需要修改
+    // ============================================================
+
+    // ---- 爬取目标 ----
+
+    // 要爬取的微博用户 ID 列表
+    // 类型: string[] 或 string (txt 文件路径)
+    // 示例1: ["1223178222", "1669879400"]
+    // 示例2: "user_id_list.txt"  (每行一个用户ID，可选加昵称和since_date)
+    "user_id_list": ["1234567890"],
+
+    // 是否只爬取原创微博
+    // 0 = 爬取全部微博（原创 + 转发）
+    // 1 = 只爬取原创微博
+    "only_crawl_original": 0,
+
+    // 开始爬取的时间范围
+    // 支持三种格式:
+    //   "yyyy-mm-dd"         → 爬取该日期之后的微博，如 "2025-01-01"
+    //   "yyyy-mm-ddTHH:MM:SS" → 精确到秒
+    //   整数                  → 爬取最近 N 天的微博，如 7 表示最近 7 天
+    "since_date": "2025-01-01",
+
+    // 截止爬取的时间范围（可选，为空则不限制）
+    // 格式同 since_date，只爬取该日期之前发布的微博
+    "end_date": "",
+
+    // 起始页码，默认 1
+    // 如果中途被限制中断，可设为中断时的页码继续爬取
+    "start_page": 1,
+
+    // 每页爬取的微博数量
+    // 取值范围: 1-100，建议 10-20，太大可能被限制
+    "page_weibo_count": 20,
+
+    // 关键词过滤列表（可选）
+    // 类型: string[] 或逗号分隔的字符串
+    // 留空 [] 表示爬取全部微博
+    // 示例: ["梦想", "希望"] 或 "梦想,希望"
+    // 注意: 关键词搜索需要配置 cookie
+    "query_list": [],
+
+    // ---- 输出格式 ----
+
+    // 数据输出格式（可多选）
+    // 可选项: csv, json, mysql, mongo, sqlite, post, markdown
+    // 示例: ["csv", "json", "markdown"]
+    "write_mode": ["csv", "json"],
+
+    // Markdown 文件分割方式（仅 write_mode 含 markdown 时生效）
+    // day          → 按天分割，文件平铺在同级目录
+    // day_by_month → 按天分割，按月归档到子文件夹
+    // month        → 按月分割
+    // year         → 按年分割
+    // all          → 所有微博写入单个文件
+    "markdown_split_by": "day_by_month",
+
+    // 是否移除微博正文中的 HTML 标签
+    // 0 = 保留原始 HTML
+    // 1 = 移除标签，只保留纯文本
+    "remove_html_tag": 1,
+
+    // ---- 文件下载 ----
+
+    // 是否下载原创微博中的图片 (0=否, 1=是)
+    "original_pic_download": 1,
+
+    // 是否下载转发微博中的图片 (0=否, 1=是)
+    // 仅当 only_crawl_original=0 时生效
+    "retweet_pic_download": 0,
+
+    // 是否下载原创微博中的视频 (0=否, 1=是)
+    "original_video_download": 1,
+
+    // 是否下载转发微博中的视频 (0=否, 1=是)
+    "retweet_video_download": 0,
+
+    // 是否下载原创微博 Live Photo 中的视频 (0=否, 1=是)
+    "original_live_photo_download": 1,
+
+    // 是否下载转发微博 Live Photo 中的视频 (0=否, 1=是)
+    "retweet_live_photo_download": 0,
+
+    // ---- 评论与转发下载 ----
+
+    // 是否下载微博评论 (0=否, 1=是)
+    // 仅当 write_mode 含 sqlite 时生效
+    "download_comment": 0,
+
+    // 每条微博最多下载的评论数
+    "comment_max_download_count": 100,
+
+    // 是否下载评论中的图片 (0=否, 1=是)
+    "comment_pic_download": 0,
+
+    // 是否下载微博转发 (0=否, 1=是)
+    // 仅当 write_mode 含 sqlite 时生效
+    "download_repost": 0,
+
+    // 每条微博最多下载的转发数
+    "repost_max_download_count": 100,
+
+    // ---- 输出设置 ----
+
+    // 数据输出根目录，默认为 "weibo_data"
+    "output_directory": "weibo_data",
+
+    // 是否用用户 ID 作为子文件夹名称
+    // 0 = 使用用户昵称（可能变化，更直观）
+    // 1 = 使用用户 ID（不可变，保证一致性）
+    "user_id_as_folder_name": 0,
+
+    // ---- 认证 ----
+
+    // 单 Cookie 字符串（向后兼容）
+    // 获取方式: 浏览器登录 m.weibo.cn → F12 → Network → 请求头中的 Cookie
+    "cookie": "your_cookie_here",
+
+    // 多 Cookie 数组（并行模式使用，可选）
+    // 并行模式下每个 worker 使用一个 cookie
+    // worker 数量 = min(max_workers, len(cookies))
+    "cookies": [
+        "cookie_string_from_account_1",
+        "cookie_string_from_account_2"
+    ],
+
+    // ---- 数据库配置（可选） ----
+
+    // SQLite 数据库文件路径（仅 write_mode 含 sqlite 时生效）
+    "sqlite_db_path": "weibodata.db",
+
+    // 是否在 SQLite 中存储图片/视频的二进制数据
+    // 0 = 只存储路径，1 = 存储二进制（文件会很大）
+    "store_binary_in_sqlite": 0,
+
+    // MySQL 数据库配置（仅 write_mode 含 mysql 时需要）
+    "mysql_config": {
+        "host": "localhost",
+        "port": 3306,
+        "user": "root",
+        "password": "123456",
+        "charset": "utf8mb4"
+    },
+
+    // MongoDB 连接字符串（仅 write_mode 含 mongo 时需要）
+    // 格式: mongodb://[username:password@]host[:port]/[database][?options]
+    "mongodb_URI": "mongodb://localhost:27017",
+
+    // HTTP POST 配置（仅 write_mode 含 post 时需要）
+    // 将爬取结果以 JSON 格式 POST 到指定 API
+    "post_config": {
+        "api_url": "https://api.example.com/weibo",
+        "api_token": "your_api_token"
+    },
+
+    // ---- 文件元数据 ----
+
+    // 是否将微博发布时间写入图片 EXIF 信息 (0=否, 1=是)
+    "write_time_in_exif": 1,
+
+    // 是否修改下载文件的系统时间戳为微博发布时间 (0=否, 1=是)
+    "change_file_time": 1,
+
+    // ---- 反封禁配置 ----
+
+    "anti_ban_config": {
+        // 是否启用反封禁机制（强烈建议开启）
+        "enabled": true,
+
+        // 单次运行最大微博数量
+        // 达到此数量后自动暂停，防止一次性爬取过多
+        "max_weibo_per_session": 500,
+
+        // 批次大小: 每爬取 N 条微博后执行批次延迟
+        "batch_size": 50,
+
+        // 批次延迟时间（秒）: 每批次后的强制等待
+        "batch_delay": 30,
+
+        // 请求延迟范围（秒）
+        // 每次 API 请求前的随机等待时间
+        "request_delay_min": 8,
+        "request_delay_max": 15,
+
+        // 最大单次运行时间（秒）
+        // 达到此时间后强制休息
+        "max_session_time": 600,
+
+        // 最大 API 错误次数
+        // 达到此次数后强制休息
+        "max_api_errors": 5,
+
+        // 休息时间最小值（秒）
+        // 触发休息条件后暂停的时间（实际值会随机波动 ±10%）
+        "rest_time_min": 180,
+
+        // 随机额外休息概率
+        // 每次检查时有一定概率触发随机休息，模拟人类行为
+        // 测试时可设为 0，生产环境建议 0.01
+        "random_rest_probability": 0.01,
+
+        // User-Agent 池
+        // 每次请求随机选择一个，模拟不同设备/浏览器
+        "user_agents": [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Linux; Android 14; SM-S9180) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.113 Mobile Safari/537.36"
+        ],
+
+        // Accept-Language 池
+        "accept_languages": [
+            "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+            "zh-TW,zh;q=0.9,en;q=0.8"
+        ],
+
+        // Referer 池
+        "referer_list": [
+            "https://m.weibo.cn/",
+            "https://weibo.com/",
+            "https://www.weibo.com/"
+        ]
+    },
+
+    // ---- 并行爬取配置 ----
+
+    "parallel": {
+        // 最大并行 worker 数量
+        // 1 = 串行（默认，向后兼容）
+        // 2~3 = 并行（需要至少 2 个有效的 cookie）
+        // worker 数不会超过 cookies 数组长度
+        "max_workers": 1,
+
+        // 是否启用并行特性
+        // false = 强制串行（即使 max_workers > 1）
+        "enable": true
+    }
+
+    // ---- 可选：LLM 分析配置 ----
+    // 如果配置此项，会对每条微博进行 AI 分析（情感、摘要、异常检测）
+    // 需要 OpenAI 兼容的 API 端点
+    // "llm_config": {
+    //     "api_base": "https://api.openai.com/v1",
+    //     "api_key": "sk-xxx",
+    //     "model": "gpt-4o-mini",
+    //     "max_tokens": 1000,
+    //     "temperature": 0.7,
+    //     "timeout": 30,
+    //     "enable_sentiment_analysis": true,
+    //     "enable_summary": true,
+    //     "enable_anomaly_detection": true
+    // }
+}
